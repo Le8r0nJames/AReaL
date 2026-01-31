@@ -63,7 +63,7 @@ repos:
     hooks:
       - id: generate-cli-docs
         name: Generate CLI documentation
-        entry: python docs/generate_cli_docs.py
+        entry: bash -c 'source .venv/bin/activate && python docs/generate_cli_docs.py'
         language: system
         files: ^(areal/api/cli_args\.py|docs/generate_cli_docs\.py)$
         pass_filenames: false

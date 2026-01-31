@@ -1,0 +1,120 @@
+# TerminalBench LoRA SFT Training Configuration for Qwen2.5-7B
+# Train with GPT-5 collected trajectories (10 samples)
+# Allows controlled overfitting for initial checkpoint
+
+experiment_name: terminalbench-qwen25-sft-lora-gpt5
+trial_name: trial0
+
+seed: 1
+enable_offload: false
+total_train_epochs: 20  # 10 samples, moderate epochs
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 4
+  fileroot: /tmp/areal/experiments
+  name_resolve:
+    type: nfs
+    nfs_record_root: /tmp/areal/name_resolve
+
+allocation_mode: d4p1t1  # Use 4 GPUs for FSDP training
+
+scheduler:
+  type: local
+
+actor:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: Qwen/Qwen2.5-7B-Instruct
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16  # bfloat16 saves memory vs float16
+  attn_impl: "eager"
+  mb_spec:
+    max_tokens_per_mb: 4096  # Reduce to avoid OOM
+  optimizer:
+    type: adam
+    lr: 2.0e-4  # Moderate learning rate for controlled overfitting
+    weight_decay: 0.01  # Small weight decay to prevent too much overfitting
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: cosine  # Cosine decay for smoother training
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.1
+  # LoRA configuration
+  use_lora: true
+  peft_type: lora
+  lora_rank: 16
+  lora_alpha: 32  # alpha = 2 * rank
+  target_modules: [all-linear]  # Apply LoRA to all linear layers
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 8
+      mem: 64
+      cmd: python3 -m areal.scheduler.rpc.rpc_server
+      env_vars: {}
+
+# Training dataset - GPT-5 trajectories
+train_dataset:
+  batch_size: 1  # Reduce to 1 to avoid OOM
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: terminalbench_sft_data/harbor_gpt5_positive_rewards.jsonl
+  type: sft
+  max_length: 4096  # Reduce to avoid OOM
+
+# Validation dataset - same as training (allow overfitting)
+valid_dataset:
+  batch_size: 1  # Reduce to 1 to avoid OOM
+  pin_memory: true
+  num_workers: 4
+  path: terminalbench_sft_data/harbor_gpt5_positive_rewards.jsonl
+  type: sft
+  max_length: 4096  # Reduce to avoid OOM
+
+# Utilities
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1  # Save every epoch to track overfitting
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: 3600
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false

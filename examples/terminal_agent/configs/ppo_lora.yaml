@@ -1,0 +1,199 @@
+# TerminalBench PPO LoRA Training Configuration for Qwen2.5-7B
+# Continue training from SFT checkpoint with LoRA adapters
+# Uses Harbor rollout workflow with partial reward verifier
+
+experiment_name: terminalbench-qwen25-ppo-lora
+trial_name: trial0
+
+seed: 1
+enable_offload: false
+total_train_epochs: 10
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 4
+  fileroot: /tmp/areal/experiments
+  name_resolve:
+    type: nfs
+    nfs_record_root: /tmp/areal/name_resolve
+
+# Cluster allocation: 1 GPU for vLLM, 3 GPUs for FSDP training
+allocation_mode: "vllm:d1p1t1+fsdp:d3"
+
+scheduler:
+  type: local
+
+# Rollout configuration
+rollout:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  max_concurrent_rollouts: 16
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 2
+  enable_rollout_tracing: false
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1  # SGLang/vLLM needs GPU access
+      cpu: 8
+      mem: 64
+      cmd: python3 -m areal.scheduler.rpc.rpc_server
+      env_vars: {}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+
+# Generation hyperparameters
+gconfig:
+  n_samples: 4  # GRPO需要多个样本计算group advantage
+  min_new_tokens: 32
+  max_new_tokens: 1024  # CRITICAL: 限制输出长度，避免60k token rollout
+  greedy: false
+  temperature: 0.6
+  top_p: 0.9
+
+# Actor model - starting from SFT checkpoint with LoRA
+actor:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: Qwen/Qwen2.5-7B-Instruct  # Override via CLI for SFT checkpoint
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: float16
+  attn_impl: "eager"
+  mb_spec:
+    max_tokens_per_mb: 8192  # Reduced to avoid OOM
+  optimizer:
+    type: adam
+    lr: 5.0e-6  # Lower LR for fine-tuning on SFT checkpoint
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: cosine
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.05
+  # LoRA configuration - same as SFT
+  use_lora: true
+  peft_type: lora
+  lora_rank: 16
+  lora_alpha: 32
+  target_modules: [all-linear]
+  # PPO-specific settings (GRPO mode)
+  eps_clip: 0.2
+  eps_clip_higher: 0.28
+  temperature: ${gconfig.temperature}
+  reward_scaling: 1
+  reward_bias: 0
+  kl_ctl: 0.0  # CRITICAL: Set to 0 to disable reference model (GRPO mode)
+  ppo_n_minibatches: 1
+  recompute_logprob: false
+  use_decoupled_loss: true
+  behav_imp_weight_cap: 5.0
+  prox_logp_method: "loglinear"  # CRITICAL: Use log-linear approximation to avoid NaN in float16
+  # GRPO: Use group-based reward normalization
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 8
+      mem: 64
+      cmd: python3 -m areal.scheduler.rpc.rpc_server
+      env_vars: {}
+
+# Reference model - same config as actor but won't be loaded (kl_ctl=0)
+ref:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    max_tokens_per_mb: 4096
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+
+# vLLM configuration
+vllm:
+  model: ${actor.path}
+  seed: ${seed}
+  skip_tokenizer_init: false
+  dtype: ${actor.dtype}
+  max_model_len: 32768
+  gpu_memory_utilization: 0.9  # Leave memory for FSDP training
+  served_model_name: "qwen2.5-7b-lora"  # Model name for API
+
+# Training dataset - Using Terminal-Bench 2.0 from Harbor registry
+train_dataset:
+  batch_size: 1  # Moderate batch size for 7B model
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: "terminalbench:terminal-bench-sample@2.0"
+  type: "rl"
+  max_length: 4096  # Match SFT config
+
+# Validation dataset
+valid_dataset:
+  batch_size: 1
+  pin_memory: true
+  num_workers: 4
+  path: "terminalbench:terminal-bench-sample@2.0"
+  type: "rl"
+  max_length: 4096
+
+# Utilities
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: 3600
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false

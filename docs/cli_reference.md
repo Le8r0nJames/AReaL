@@ -605,6 +605,7 @@ https://docs.vllm.ai/en/stable/api/index.html for detailed documentation.
 | `uvicorn_log_level`            | string          | `"warning"`                                                         | -           |
 | `enable_lora`                  | boolean         | `False`                                                             | -           |
 | `lora_modules`                 | string          | `""`                                                                | -           |
+| `served_model_name`            | string \| None  | `None`                                                              | -           |
 
 (section-train-dataset)=
 

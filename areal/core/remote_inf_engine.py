@@ -1170,8 +1170,27 @@ class RemoteInfEngine(InferenceEngine):
 
     def launch_server(self, server_args: dict[str, Any]) -> LocalInfServerInfo:
         """Launch a local inference server."""
-        server_args["host"] = gethostip()
-        server_args["port"] = find_free_ports(1)[0]
+        # Support fixed host/port via environment variables for Harbor integration
+        # When Harbor containers need to access vLLM, set:
+        #   VLLM_HOST=0.0.0.0 (bind all interfaces)
+        #   VLLM_PORT=10001 (fixed port, should be published to host)
+        import os
+
+        fixed_host = os.getenv("VLLM_HOST")
+        fixed_port = os.getenv("VLLM_PORT")
+
+        if fixed_host:
+            server_args["host"] = fixed_host
+            logger.info(f"Using fixed vLLM host from VLLM_HOST: {fixed_host}")
+        else:
+            server_args["host"] = gethostip()
+
+        if fixed_port:
+            server_args["port"] = int(fixed_port)
+            logger.info(f"Using fixed vLLM port from VLLM_PORT: {fixed_port}")
+        else:
+            server_args["port"] = find_free_ports(1)[0]
+
         process = self.backend.launch_server(server_args)
         address = f"{server_args['host']}:{server_args['port']}"
         server_info = LocalInfServerInfo(

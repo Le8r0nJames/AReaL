@@ -1087,6 +1087,7 @@ class vLLMConfig:
     uvicorn_log_level: str = "warning"
     enable_lora: bool = False
     lora_modules: str = ""
+    served_model_name: str | None = None  # Override model name exposed in API
 
     @staticmethod
     def build_args(
