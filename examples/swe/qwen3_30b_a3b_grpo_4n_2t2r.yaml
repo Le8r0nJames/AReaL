@@ -1,0 +1,393 @@
+# Qwen3-Coder-30B-A3B-Instruct SWE-RL (GRPO) 配置 —— 4 节点 2 推 2 训。
+#
+# 关键设置：
+#   - 模型: Qwen3-Coder-30B-A3B-Instruct（qwen3_moe, 48 层, 128 experts, 8/tok）。
+#   - rollout: sglang d2t8p1（2 副本 TP=8，占 2 个 8 卡节点）。
+#   - actor:  megatron (attn:d2p1t4c2|ffn:d2p1e8)（2 个节点，16 GPU）。
+#   - tool_call_parser: qwen3_coder —— Qwen3-Coder 的 XML 工具格式。
+#   - agent: 独立 AWEAgent 仓库（默认 /storage/openpsi/users/chucai.dzq/codes/ant-code/AWEAgent）。
+#   - 数据: scaleswe top64 evalv2（含 eval_script + faas-image，可算 reward）。
+#
+# 启动入口见 examples/swe/run_qwen3_30b_a3b.sh：controller 直接跑
+# train_swe_rl.py，scheduler.type=slurm 由 AReaL 内部拉起 rollout/actor/proxy worker。
+
+experiment_name: chucai-swe-demo-qwen
+trial_name: demo1
+
+seed: 42
+enable_offload: true
+total_train_epochs: 10
+# 100 step × batch 4 = 400 prompts，作为 baseline 首跑。
+total_train_steps: 100
+tokenizer_path: ${actor.path}
+# should_accept_fn 接收 group dict（n_samples=4 条 traj）；组内 reward 全相同则拒
+# （无学习信号），否则接受。
+# should_accept_fn: "areal.examples.filter_function.filter_function"
+
+# 实验退出后清理外部 SWE 沙箱实例。LOG_DIR 自动注入；失败不阻塞退出。
+post_exit_hook: 'AWE_ROOT=\${AWEAGENT_ROOT:-\${SWE_AGENT_ROOT:-/storage/openpsi/users/chucai.dzq/codes/ant-code/AWEAgent}}; cd "$AWE_ROOT" && PYTHONPATH=$PWD:$PYTHONPATH pip install -q -r requirements.txt && AENV_SYSTEM_URL=\${AENV_SYSTEM_URL} python -m aweagent.maintenance.clean_instances'
+
+cluster:
+  # 4 台 8 卡节点：2 台 rollout，2 台 actor training。
+  n_nodes: 4
+  n_gpus_per_node: 8
+  # 日志、checkpoint、rollout dump 等 AReaL 产物根目录（须在共享 /storage 上）。
+  fileroot: /storage/openpsi/users/chucai.dzq/areal-data/experiments
+  name_resolve:
+    type: nfs
+    # Slurm worker 之间共享地址发现记录。
+    nfs_record_root: /storage/openpsi/users/chucai.dzq/areal-data/name_resolve/swe-rl-qwen3-30b-a3b
+
+# 本分支 (gh) 通过 rollout.backend / actor.backend / ref.backend 各自解析分配，
+# 不用顶层 allocation_mode。
+# Rollout(SGLang): 2 副本 × TP8 = 16 GPU（2 节点）。
+# Actor(Megatron): attn DP2 PP1 TP4 CP2 = 16 GPU；ffn DP2 PP1 EP8（2 节点）。
+
+scheduler:
+  type: slurm
+
+gconfig:
+  n_samples: 4
+  min_new_tokens: 0
+  max_new_tokens: 131071
+  max_tokens: 131071
+  greedy: false
+  lora_name: ""
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 1000000
+
+rollout:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  backend: "sglang:d2t8p1"
+  # 2 推 2 训：沿用 miumiu H800 原值，仅副本数随拓扑增加。
+  max_concurrent_rollouts: 32
+  queue_size: null
+  consumer_batch_size: 4
+  # 允许训练侧用比 head 旧 4 个 step 的 rollout，避免 GPU 等 rollout 时闲置。
+  max_head_offpolicyness: 4
+  enable_rollout_tracing: true
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+  # 300→900:smoke3 因 rollout worker 排队 >300s 超时(提交时集群恰好满)。
+  # 集群繁忙时放宽等待,避免 actor 已就绪却因 rollout 排队而整体失败。
+  setup_timeout: 900.0
+  request_timeout: 20000.0
+  request_retries: 3
+  pause_grace_period: 30
+  # gh 重构：原 rollout.openai 块迁到 rollout.agent (AgentConfig)；
+  # schedule_policy 字段已移除。
+  agent:
+    mode: inline
+    # proxy 绑非 loopback IP（多机必须）时，AReaL 拒绝用默认 admin key；
+    # 启动脚本会在未设置时按 trial 生成 SWE_RL_ADMIN_API_KEY，避免在 YAML 写固定 key。
+    admin_api_key: ${oc.env:SWE_RL_ADMIN_API_KEY}
+    # Qwen3-Coder-30B-A3B-Instruct 走 qwen3_coder XML 风格工具调用(非 hermes JSON),
+    # 对齐 miumiu 跑通的 coder 配置。换回 Instruct 模型时需改回 qwen25。
+    tool_call_parser: qwen3_coder
+    # Qwen3-Coder 非思考变体，不吐 <think>；qwen3 reasoning parser 为无害 no-op。
+    reasoning_parser: qwen3
+    chat_template_type: concat
+    engine_max_tokens: ${gconfig.max_tokens}
+    export_style: concat
+    turn_discount: 1.0
+    session_timeout_seconds: 3600
+    # CC/Claude-Code style clients add volatile Anthropic metadata between
+    # turns. Keep these enabled for concat export so the same config can train
+    # SWE now and CC later by switching econfig.agent_type.
+    prefix_matcher: examples.swe.prefix_matchers.swe_prefix_matcher
+    message_preprocessors:
+      - examples.swe.preprocessors.StripAnthropicBillingHeader
+      - examples.swe.preprocessors.StripAllSystemReminders
+      - examples.swe.preprocessors.StripAnthropicCacheFields
+      - examples.swe.preprocessors.NormalizeToolCallArguments
+
+actor:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  # attn DP2 PP1 TP4 CP2 = 16 GPU;ffn DP2 PP1 EP8 = 16 GPU。
+  # CP=2 切超长序列省显存。需配合 megatron_engine.py 中 forward_batch 的
+  # gather_cp_output=True 修复(compute_logp 在 CP>1 时把 CP-local 输出 gather 回全长,
+  # 否则被全局 output_seqlens split 而崩,见 colocation-swe 同款修复)。
+  backend: "megatron:(attn:d2p1t4c2|ffn:d2p1e8)"
+  # 训练模型路径；脚本可用 MODEL_PATH 覆盖。
+  path: /storage/openpsi/models/Qwen__Qwen3-Coder-30B-A3B-Instruct
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  grad_reduce_dtype: float32
+  mb_spec:
+    n_mbs: 1
+    granularity: 1
+    # 128K:覆盖满长度 traj(context_length=131072);CP=2 下每卡实际处理 65536 token。
+    max_tokens_per_mb: 131072
+    n_mbs_divisor: 1
+  optimizer:
+    type: adam
+    lr: 3.0e-6
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-8 #1.0e-6
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.001
+  megatron:
+    wrap_with_ddp: true
+    ddp:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: true  #false
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+    use_deterministic_algorithms: true
+    enable_fp32_lm_head: false  # not supported by megatron-core MLATransformerConfig
+    cross_entropy_loss_fusion: false
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    moe_router_dtype: fp32
+    moe_token_dispatcher_type: alltoall
+    moe_router_bias_update_rate: 0.0
+  # PPO / GRPO settings
+  eps_clip: 0.2
+  eps_clip_higher: 0.28
+  temperature: ${gconfig.temperature}
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: false
+  # gh 分支 ProxLogpMethod 仅接受 recompute/loglinear/metrics;旧值 reuse_train_logp
+  # 已移除(否则 train() 报 "not a valid ProxLogpMethod")。改用标准 decoupled PPO 的
+  # recompute(框架默认、无近似);若要省一次 proximal forward 再评估 loglinear。
+  prox_logp_method: recompute
+  use_decoupled_loss: true
+  # gh 移除了 behave_imp_weight_cap；旧 (cap=5.0, token_mask) 行为等价为：
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: ratio
+    upper: 5.0
+  discount: 1.0
+  gae_lambda: 1.0
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  reward_clip: 5.0
+  reward_norm: # check
+    mean_level: group
+    std_level: group
+    # GRPO 每题 4 条 rollout，按 group 做 reward normalize。
+    group_size: 4
+    eps: 1.0e-5
+  adv_norm:
+    mean_level: null
+    std_level: null
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 4
+      mem: 32
+      # 独占整机（对齐正在跑通的 swe-qwen35 实验：reservation + exclusive）。
+      exclusive: true
+      # 使用 swe-rl 资源池预留（scheduler 会发 --reservation=swe-rl）。
+      reservation: swe-rl
+      nodelist: null
+      exclude: null
+      # worker 使用 areal-dev.sif；controller 仍直接运行训练脚本。
+      image: /storage/openpsi/images/areal-dev.sif
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        NCCL_TIMEOUT: 600
+        # 对齐 swe-qwen35 实验的 NCCL 稳定性开关。
+        NCCL_CUMEM_ENABLE: 0
+        NCCL_NVLS_ENABLE: 0
+        PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+        # worker 默认 HOME=/home/admin 在 container tmpfs 里只有 ~2GB，flashinfer JIT
+        # 编译会撑爆 → "No space left on device"。把 HOME + 各类 cache 指到 /storage。
+        HOME: "/storage/openpsi/users/chucai.dzq/areal-data/cache/home"
+        FLASHINFER_WORKSPACE_DIR: "/storage/openpsi/users/chucai.dzq/areal-data/cache/flashinfer"
+        HF_HOME: "/storage/openpsi/users/chucai.dzq/areal-data/cache/hf"
+        XDG_CACHE_HOME: "/storage/openpsi/users/chucai.dzq/areal-data/cache/xdg"
+        # Triton 放本机 /tmp，避免共享 NFS 下多进程编译 stale handle。
+        TRITON_CACHE_DIR: "/tmp/areal-${oc.env:USER,admin}-${trial_name}/triton_cache/$HOSTNAME"
+        # worker 需要能 import 暂存到 /storage 的本分支 AReaL + 独立 AWEAgent。
+        # 注意：不要加 miumiu 的 areal-deps/aenv 目录（捆绑 starlette 1.2.1 会污染）；
+        # aenv 由 additional_bash_cmds 的 uv pip install aenvironment 干净装入 venv。
+        # （实际 worker PYTHONPATH 由 controller sys.path 派生，此项主要作文档/兜底。）
+        PYTHONPATH: "/storage/openpsi/users/chucai.dzq/codes/ant-code/AWEAgent:/storage/openpsi/users/chucai.dzq/codes/swe-rl-areal/AReaL"
+        # AEnv 服务地址（对齐正在跑通的 swe-qwen35 实验：33.180.184.119）。
+        # 登录节点 curl 不通属网段隔离，计算节点可达；脚本可用 AENV_SYSTEM_URL 覆盖。
+        AENV_SYSTEM_URL: "http://api-service-k8s.aenv.svc.et15-02-aidc.sh.s-aidc.local:8080"
+        # AWEAgent 独立仓库根目录；同时设 SWE_AGENT_ROOT 与
+        # AWEAGENT_ROOT，兼容旧变量名与 post_exit_hook。
+        SWE_AGENT_ROOT: "/storage/openpsi/users/chucai.dzq/codes/ant-code/AWEAgent"
+        AWEAGENT_ROOT: "/storage/openpsi/users/chucai.dzq/codes/ant-code/AWEAgent"
+        # SWEAgent OpenAIModel 用该名称作为请求 model 字段（仅 agent 侧消费）。
+        OPENAI_MODEL: "Qwen3-Coder-30B-A3B-Instruct"
+        WANDB_DIR: "/storage/openpsi/users/chucai.dzq/areal-data/wandb"
+        AREAL_CACHE_DIR: "/tmp/areal-${oc.env:USER,admin}-${trial_name}"
+        PYTORCH_KERNEL_CACHE_PATH: "/tmp/areal-${oc.env:USER,admin}-${trial_name}/torch_kernel_cache/$HOSTNAME"
+        TORCHINDUCTOR_CACHE_DIR: "/tmp/areal-${oc.env:USER,admin}-${trial_name}/torchinductor_cache/$HOSTNAME"
+        TORCH_EXTENSIONS_DIR: "/tmp/areal-${oc.env:USER,admin}-${trial_name}/torch_extensions/$HOSTNAME"
+        VLLM_CACHE_ROOT: "/tmp/areal-${oc.env:USER,admin}-${trial_name}/vllm_cache/$HOSTNAME"
+      additional_bash_cmds:
+        # CA 修复(必须在所有 pip install 之前)：登录节点环境把 CURL_CA_BUNDLE 设成
+        # /etc/ssl/certs/ca-bundle.crt 并透传进容器，但该路径在 areal-dev.sif 里不存在
+        # （容器真实证书是 ca-certificates.crt）→ pip 走公司源 https TLS 校验时报
+        # "Could not find a suitable TLS CA certificate bundle" → aenv/fastmcp 全装不上
+        # → rollout 每条轨迹 import aenv 失败被 reject、reward 恒 0、空转刷日志
+        # （k8s_top64_run2/run5 即此症;run1 及更早因当时未透传该坏 env 而正常）。
+        # 显式指向容器内真实证书，不依赖登录节点环境，可复现。
+        - "export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt PIP_CERT=/etc/ssl/certs/ca-certificates.crt"
+        # aenv（aenvironment）干净装进 venv。绝不能把 miumiu 的 aenv 目录加 PYTHONPATH——
+        # 那目录捆绑 starlette 1.2.1，会遮蔽 venv 的 0.50.0，使 sglang http_server 启动崩
+        # （FastAPI: Router.__init__() got an unexpected keyword argument 'on_startup'）。
+        # 关键:worker 的裸 pip/python/python3 全是 miniconda(python3.10),但 areal worker
+        # 实际跑在 /opt/.venv(python3.12,其 site-packages 在 worker PYTHONPATH 里)。用裸 pip
+        # 会把 aenv 装进 miniconda3.10,venv 的 python3.12 import 不到(No module named aenv)。
+        # 故必须显式用 /opt/.venv 的 python 安装(venv 默认无 pip → 先 ensurepip 从镜像内置 wheel 补)。
+        # 又:aenv 0.1.8rc2 完整安装会因其 pydantic<2.12 约束,卸载+重装 venv 的 pydantic 2.12.5
+        # (root 下装残→ImportError: cannot import name 'BaseModel' from 'pydantic' unknown location,
+        # worker 全崩);故 --no-deps 只装 aenv 本体(不碰 pydantic),单独补它唯一缺的 fastmcp<3
+        # (aenv 要 fastmcp<3,>=2.13;3.x 改了包结构 from fastmcp import Client 失败)。
+        - "/opt/.venv/bin/python -m ensurepip --upgrade >/dev/null 2>&1 || true"
+        - "/opt/.venv/bin/python -m pip install --no-deps aenvironment==0.1.8rc2 || echo 'WARN: aenvironment install failed'"
+        - "/opt/.venv/bin/python -m pip install 'fastmcp<3' || echo 'WARN: fastmcp install failed'"
+        # 自检：用 venv 的 python 验证 aenv/aweagent 可导入；其余 agent 依赖镜像已含。
+        - "/opt/.venv/bin/python -c 'import aenv, aweagent' || echo 'WARN: aenv/aweagent import failed'"
+        # torch_memory_saver preload（本镜像 venv 在 /opt/.venv）。
+        - export LD_PRELOAD=$(find /opt/.venv -name 'torch_memory_saver_hook_mode_preload.abi3.so' 2>/dev/null | head -1)
+
+ref:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  backend: ${actor.backend}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: false
+  dtype: ${actor.dtype}
+  mb_spec:
+    n_mbs: 1
+    granularity: 1
+    max_tokens_per_mb: 131072
+    n_mbs_divisor: 1
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+
+# SWE-bench agent environment
+econfig:
+  dataset_path: ""
+  # Switch to "cc" with AGENT_TYPE=cc / econfig.agent_type=cc to train
+  # Claude Code through the same AReaL proxy path.
+  agent_type: swe
+  agent_config: ""
+  swe_agent_config: 1_0_0/min-swe-agent-train-top1
+  cc_agent_config: train_cc_time3600
+  agent_root: /storage/openpsi/users/chucai.dzq/codes/ant-code/AWEAgent
+  swe_agent_root: /storage/openpsi/users/chucai.dzq/codes/ant-code/AWEAgent
+  llm_model: ""
+  opencode_provider: ""
+  codex_provider: ""
+  max_completion_tokens: 131071
+  timeout: 3600.0
+
+# SGLang inference server
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: true
+  dtype: ${actor.dtype}
+  context_length: 131072
+  max_prefill_tokens: 131071
+  # 单 rollout server 同时处理 16 个请求，2 副本合计覆盖当前并发。
+  max_running_requests: 16
+  mem_fraction_static: 0.85
+  chunked_prefill_size: 8192
+  cuda_graph_max_bs: 16
+  schedule_policy: fcfs
+  attention_backend: fa3
+  log_level: info
+  log_requests: false
+  sampling_backend: pytorch # flashinfer
+  enable_memory_saver: false
+  disable_radix_cache: false
+  triton_attention_num_kv_splits: 16
+  disable_custom_all_reduce: true
+  disable_cuda_graph: false
+
+# Datasets
+train_dataset:
+  # filtered 约 2000 条，batch=8；降低 AEnv 并发压力。
+  batch_size: 4
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: /storage/openpsi/users/chucai.dzq/projects/swedemo/datasets/processed_to_upload_top64_evalv2.jsonl
+  type: rl
+  max_length: 32768
+  drop_last: true
+
+valid_dataset:
+  batch_size: 4
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: /storage/openpsi/users/chucai.dzq/projects/swedemo/datasets/processed_to_upload_top64_evalv2.jsonl
+  type: rl
+
+# Utilities
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: 10
+  freq_secs: null
+
+recover:
+  mode: auto
+  retries: 3
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_secs: 7200
+  # checkpointer.py 已 port swe/main 的 dp_reshardable 修复(use_distributed_optimizer
+  # 下用 distrib_optim_sharding_type=dp_reshardable,避开 megatron-core 0.16 的
+  # flattened_range 不兼容),save optimizer 可正常工作,无需再靠 no_save_optim 规避;
+  # 保留存/载 optimizer state 以支持断点续训。
+  no_save_optim: false
+  no_load_optim: false
+  freq_steps: 10
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: online
+    wandb_base_url: http://8.150.1.98:8080
+    # wandb_api_key 由启动脚本从环境变量注入，避免在 YAML 写密钥。
+
+perf_tracer:
+  enabled: false
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  session_tracer:
+    enabled: false

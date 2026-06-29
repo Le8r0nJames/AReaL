@@ -343,6 +343,43 @@ def _build_messages_list(item: dict) -> list[dict]:
     return messages_list
 
 
+def _parse_tool_call_arguments(messages: list[dict]) -> list[dict]:
+    """Return a new message list with tool_call arguments parsed from JSON strings
+    to dicts. Some chat templates (e.g. GLM-5.1) iterate over arguments with
+    .items(), which fails when arguments is a JSON string per OpenAI API convention.
+
+    Only creates new dicts where modifications are needed; unaffected messages
+    are shared with the input list to avoid expensive deep copies.
+    """
+    result = []
+    for msg in messages:
+        tool_calls = msg.get("tool_calls") if isinstance(msg, dict) else None
+        if not tool_calls:
+            result.append(msg)
+            continue
+        new_tool_calls = []
+        modified = False
+        for tc in tool_calls:
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            if fn is None:
+                new_tool_calls.append(tc)
+                continue
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                try:
+                    parsed = json.loads(args)
+                    tc = {**tc, "function": {**fn, "arguments": parsed}}
+                    modified = True
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            new_tool_calls.append(tc)
+        if modified:
+            result.append({**msg, "tool_calls": new_tool_calls})
+        else:
+            result.append(msg)
+    return result
+
+
 def concat_prompt_token_ids_with_parent(
     message_list: list[dict],
     parent: InteractionWithTokenLogpReward | None,
@@ -385,6 +422,7 @@ def concat_prompt_token_ids_with_parent(
         parent_tokens += [eos_token_id]
 
     all_message_list += message_list
+    all_message_list = _parse_tool_call_arguments(all_message_list)
 
     all_tokens = apply_chat_template(
         tokenizer,
@@ -610,6 +648,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         has_images = len(image_data) > 0
 
         tokenizer_messages = messages_for_tokenizer if has_images else messages_list
+        tokenizer_messages = _parse_tool_call_arguments(tokenizer_messages)
         if self.chat_template_type == "hf":
             prompt_token_ids = apply_chat_template(
                 self.tokenizer,
@@ -720,6 +759,9 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             n_samples=n,
             temperature=temp,
             max_new_tokens=max_new_tokens,
+            max_tokens=max_total_tokens_final
+            if max_total_tokens_final is not None
+            else len(prompt_token_ids) + max_new_tokens,
             top_p=top_p_val,
             stop=stop_tokens,
             greedy=temp == 0,
@@ -859,9 +901,17 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 )
 
             # Tool calls chunks (if any)
+            # Split each tool call into two chunks (name then arguments) to
+            # match standard OpenAI streaming behavior. LiteLLM's Anthropic
+            # streaming adapter treats the first chunk with a function name as
+            # a content_block_start trigger and discards the processed delta
+            # from that same chunk. If name and arguments are combined in a
+            # single chunk, the arguments are lost and Anthropic clients see
+            # input={}.
             if tool_calls:
                 for idx, tool_call in enumerate(tool_calls):
                     tool_call = cast(ChatCompletionMessageFunctionToolCall, tool_call)
+                    # Chunk 1: name + id, with empty arguments.
                     yield ChatCompletionChunk(
                         id=completion_id,
                         choices=[
@@ -874,6 +924,30 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                                             type="function",
                                             function=ChoiceDeltaToolCallFunction(
                                                 name=tool_call.function.name,
+                                                arguments="",
+                                            ),
+                                        )
+                                    ]
+                                ),
+                                index=0,
+                                finish_reason=None,
+                            )
+                        ],
+                        created=current_time,
+                        model="None",
+                        object="chat.completion.chunk",
+                    )
+                    # Chunk 2: arguments only, emitted as input_json_delta by
+                    # Anthropic adapters after the tool_use block has started.
+                    yield ChatCompletionChunk(
+                        id=completion_id,
+                        choices=[
+                            ChunkChoice(
+                                delta=ChoiceDelta(
+                                    tool_calls=[
+                                        ChoiceDeltaToolCall(
+                                            index=idx,
+                                            function=ChoiceDeltaToolCallFunction(
                                                 arguments=tool_call.function.arguments,
                                             ),
                                         )
@@ -1018,6 +1092,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         has_images = len(image_data) > 0
 
         tokenizer_messages = messages_for_tokenizer if has_images else messages_list
+        tokenizer_messages = _parse_tool_call_arguments(tokenizer_messages)
         if self.chat_template_type == "hf":
             prompt_token_ids = apply_chat_template(
                 self.tokenizer,
@@ -1081,6 +1156,9 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             n_samples=1,
             temperature=temp,
             max_new_tokens=max_new_tokens,
+            max_tokens=self.engine_max_tokens
+            if self.engine_max_tokens is not None
+            else len(prompt_token_ids) + max_new_tokens,
             top_p=top_p_val,
             stop=stop,
             greedy=temp == 0,

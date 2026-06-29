@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import getpass
+import importlib
 import os
 import time
 from dataclasses import asdict
+from typing import Protocol, cast
 
 import swanlab
 import torch.distributed as dist
-import trackio
 import wandb
 from tensorboardX import SummaryWriter
 
@@ -18,6 +19,21 @@ from areal.utils.printing import tabulate_stats
 from areal.version import version_info
 
 logger = logging.getLogger("StatsLogger", "system")
+
+
+class TrackioModule(Protocol):
+    def init(
+        self,
+        *,
+        project: str,
+        name: str,
+        config: dict,
+        space_id: str | None,
+    ) -> None: ...
+
+    def finish(self) -> None: ...
+
+    def log(self, data: dict, *, step: int) -> None: ...
 
 
 class StatsLogger:
@@ -96,8 +112,11 @@ class StatsLogger:
 
         # trackio init
         self._trackio_enabled = False
+        self._trackio: TrackioModule | None = None
         trackio_config = self.config.trackio
         if trackio_config.mode != "disabled":
+            trackio = cast(TrackioModule, importlib.import_module("trackio"))
+
             trackio.init(
                 project=trackio_config.project or self.config.experiment_name,
                 name=trackio_config.name or self.config.trial_name,
@@ -105,6 +124,7 @@ class StatsLogger:
                 space_id=trackio_config.space_id,
             )
             self._trackio_enabled = True
+            self._trackio = trackio
 
         # tensorboard logging
         self.summary_writer = None
@@ -127,8 +147,8 @@ class StatsLogger:
         )
         wandb.finish()
         swanlab.finish()
-        if getattr(self, "_trackio_enabled", False):
-            trackio.finish()
+        if getattr(self, "_trackio_enabled", False) and self._trackio is not None:
+            self._trackio.finish()
         if self.summary_writer is not None:
             self.summary_writer.close()
 
@@ -151,8 +171,8 @@ class StatsLogger:
             self.print_stats(item)
             wandb.log(item, step=log_step + i)
             swanlab.log(item, step=log_step + i)
-            if getattr(self, "_trackio_enabled", False):
-                trackio.log(item, step=log_step + i)
+            if getattr(self, "_trackio_enabled", False) and self._trackio is not None:
+                self._trackio.log(item, step=log_step + i)
             if self.summary_writer is not None:
                 for key, val in item.items():
                     self.summary_writer.add_scalar(f"{key}", val, log_step + i)

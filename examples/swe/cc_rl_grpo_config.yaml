@@ -1,0 +1,59 @@
+# Claude Code agent RL profile.
+#
+# This is the current-branch equivalent of
+# swe/main:examples/swe/rl/swe_rl_grpo_config.yaml, adapted to the
+# Qwen3-Coder SWE-RL base config and the flattened examples/swe layout.
+
+defaults:
+  - qwen3_30b_a3b_grpo_4n_2t2r
+  - _self_
+
+experiment_name: chucai-cc-rl-qwen
+trial_name: cc
+total_train_steps: 1000
+total_train_epochs: 17
+should_accept_fn: "areal.examples.filter_function.filter_function"
+
+gconfig:
+  n_samples: 8
+  min_new_tokens: 0
+  max_new_tokens: 131071
+  max_tokens: 131071
+  greedy: false
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 1000000
+
+rollout:
+  consumer_batch_size: 8
+  max_concurrent_rollouts: 720
+  max_head_offpolicyness: 1
+  agent:
+    session_timeout_seconds: 3600
+    engine_max_tokens: ${gconfig.max_tokens}
+
+actor:
+  reward_clip: 5.0
+  mask_no_eos_with_zero: true
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+    eps: 1.0e-5
+
+econfig:
+  agent_type: cc
+  agent_config: ""
+  cc_agent_config: train_cc_time3600_nooverfit
+  timeout: 3600.0
+
+train_dataset:
+  path: /storage/openpsi/users/fenghui/projects/AWEAgent_DEV/AWEAgent/src/data/swe_bench_verified_rl.jsonl
+  batch_size: 8
+  max_length: 32768
+  drop_last: true
+
+valid_dataset:
+  path: /storage/openpsi/users/fenghui/projects/AWEAgent_DEV/AWEAgent/src/data/swe_bench_verified_rl.jsonl
+  batch_size: 8
+  drop_last: false

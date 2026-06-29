@@ -298,7 +298,16 @@ class MegatronCheckpointManager:
         # Optimizer State Dict
         if with_optimizer:
             torch.distributed.barrier()
-            optimizer_sharded_states = self.optimizer.sharded_state_dict(state_dict)
+            # megatron-core 0.16.0 removed flattened_range support in
+            # ShardedTensor.validate_metadata_integrity(), but the default sharding
+            # type (fully_sharded_model_space) still sets flattened_range, making it
+            # unusable ("ShardedTensor.flattened_range is not supported"). The
+            # dp_reshardable type does not use flattened_range and works correctly
+            # with this version (port from swe/main).
+            optimizer_sharded_states = self.optimizer.sharded_state_dict(
+                state_dict,
+                metadata={"distrib_optim_sharding_type": "dp_reshardable"},
+            )
             state_dict["optimizer"] = optimizer_sharded_states
 
             if self.lr_scheduler is not None:

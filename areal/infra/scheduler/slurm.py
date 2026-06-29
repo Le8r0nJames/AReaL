@@ -2,6 +2,7 @@
 
 import asyncio
 import getpass
+import os
 import re
 import shlex
 import subprocess
@@ -500,7 +501,7 @@ class SlurmScheduler(Scheduler):
             # 2. Build the full raw command
             module_path = command or "areal.infra.rpc.rpc_server"
             raw_cmd = [
-                sys.executable,
+                os.environ.get("AREAL_PYTHON_EXECUTABLE", "python3"),
                 "-m",
                 module_path,
                 "--host",
@@ -836,6 +837,10 @@ class SlurmScheduler(Scheduler):
             sbatch_options.append(f"--nodelist={nodelist}")
         if exclude:
             sbatch_options.append(f"--exclude={exclude}")
+        if spec.reservation:
+            sbatch_options.append(f"--reservation={spec.reservation}")
+        if spec.exclusive:
+            sbatch_options.append("--exclusive")
 
         sbatch_options_str = "\n".join([f"#SBATCH {opt}" for opt in sbatch_options])
 

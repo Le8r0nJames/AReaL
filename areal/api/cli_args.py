@@ -921,6 +921,44 @@ class MegatronEngineConfig:
         default=False,
         metadata={"help": "Fuse token rearrangement ops during token dispatching."},
     )
+    moe_router_fusion: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable fusion for MoE TopK routing and aux-loss computation. "
+            "Requires TransformerEngine >= 2.7.0.",
+        },
+    )
+    moe_router_bias_update_rate: float = field(
+        default=1e-3,
+        metadata={
+            "help": "Update rate for auxiliary-loss-free MoE load balancing "
+            "(DeepSeek V3 style). Controls how fast expert_bias adjusts. "
+            "Default 1e-3 matches DeepSeek V3. Set 0.0 to disable.",
+        },
+    )
+    moe_z_loss_coeff: float | None = field(
+        default=None,
+        metadata={
+            "help": "Scaling coefficient for router z-loss. Complements "
+            "auxiliary-loss-free load balancing for router stability. A starting "
+            "value of 1e-3 is recommended. None disables z-loss.",
+        },
+    )
+
+    # Precision & Loss
+    enable_fp32_lm_head: bool = field(
+        default=False,
+        metadata={
+            "help": "Cast lm_head output to FP32 before loss computation for "
+            "numerical stability."
+        },
+    )
+    cross_entropy_loss_fusion: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable fused cross-entropy loss kernel for better performance."
+        },
+    )
 
     # FP8 Training Configuration
     fp8_config: FP8EngineConfig | None = None
@@ -948,6 +986,16 @@ class MegatronEngineConfig:
             "weight sync to bridge.export_hf_weights instead of the hand-rolled "
             "convert_to_hf registry. Required for models without a registry entry "
             "(e.g. Qwen3.5). FP8 paths fall back to the registry automatically.",
+        },
+    )
+
+    disable_grad_buffers_cpu_backup: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When offloading with torch_memory_saver, skip CPU backup for "
+                "Megatron gradient buffers (they are recomputed each step). "
+            )
         },
     )
 
@@ -1044,6 +1092,16 @@ class SchedulingSpec:
     )
     exclude: str | None = field(
         default=None, metadata={"help": "sbatch/srun's `--exclude` option for slurm."}
+    )
+    reservation: str | None = field(
+        default=None,
+        metadata={"help": "sbatch's `--reservation` option for slurm."},
+    )
+    exclusive: bool = field(
+        default=False,
+        metadata={
+            "help": "sbatch's `--exclusive` option for slurm. Ensures nodes are not shared with other jobs."
+        },
     )
     ray_placement_strategy: str = field(
         default="shared",
@@ -1348,8 +1406,10 @@ class RejectionSamplingConfig:
             "'ratio': direct importance ratio π_proximal/π_behave. "
             "'kl_k1': KL estimator k1 = log(r), forward KL unbiased estimator (can be negative). "
             "'kl_k2': KL estimator k2 = 0.5 * (log r)^2, non-negative quadratic approximation. "
-            "'kl_k3': KL estimator k3 = r - log(r) - 1, non-negative exact forward KL estimator.",
-            "choices": ["ratio", "kl_k1", "kl_k2", "kl_k3"],
+            "'kl_k3': KL estimator k3 = r - log(r) - 1, non-negative exact forward KL estimator. "
+            "'binary_kl': KPop (symmetric binary KL divergence) — masks tokens where either "
+            "KL(proximal||behave) or KL(behave||proximal) exceeds the upper bound.",
+            "choices": ["ratio", "kl_k1", "kl_k2", "kl_k3", "binary_kl"],
         },
     )
     agg: str = field(
@@ -2054,6 +2114,27 @@ class AgentConfig:
             "The 'concat' style exports only the final concatenated trajectory from the root. "
             "It is only suitable for linear conversation histories without token mismatching (whether valid depends on the tokenizer).",
             "choices": ["individual", "concat"],
+        },
+    )
+    message_preprocessors: list[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "List of message preprocessor class paths applied in order before "
+                "forwarding requests to the inference engine. Each entry is a dotted "
+                "import path to a callable class."
+            ),
+        },
+    )
+    prefix_matcher: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Dotted import path to a custom prefix matcher function for "
+                "InteractionCache parent-child matching. The function must accept "
+                "two list[dict] arguments (candidate prefix, full messages) and "
+                "return bool. When None, exact element-wise equality is used."
+            ),
         },
     )
     subproc_max_workers: int = field(
@@ -2841,6 +2922,17 @@ class BaseExperimentConfig:
     vllm: vLLMConfig = field(default_factory=vLLMConfig)
 
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+
+    post_exit_hook: str = field(
+        default="",
+        metadata={
+            "help": "Shell command to run after the experiment exits (normal or abnormal). "
+            "Useful for cleaning up external resources (e.g., sandbox instances). "
+            "Runs after all jobs are stopped but before recovery. "
+            "The LOG_DIR environment variable is injected automatically. "
+            "Timeout: 600 seconds. Failures are logged but do not interrupt shutdown."
+        },
+    )
 
     def __post_init__(self):
         """Validate training configuration."""

@@ -1,0 +1,348 @@
+# Bailing flash25 SWE-RL (GRPO) config for Claude Code style AWEAgent.
+#
+# This profile is the current flattened examples/swe layout equivalent of the
+# successful flash25 CC alignment run. It keeps the Bailing/SGLang-specific
+# pieces colocated with the launch scripts so the radix-cache patch and
+# flash-linear-attention PYTHONPATH are not forgotten on the next run.
+
+experiment_name: chucai-bailing-cc-rl
+trial_name: cc_flash25
+
+seed: 42
+enable_offload: false
+total_train_epochs: 1000
+total_train_steps: 1000
+tokenizer_path: ${actor.path}
+should_accept_fn: "areal.examples.filter_function.filter_function"
+
+# Clean leaked AEnv instances after controller exit. LOG_DIR/AENV_SYSTEM_URL are
+# supplied through worker/controller envs; failure here should not mask training.
+post_exit_hook: 'AWE_ROOT=\${AWEAGENT_ROOT:-\${SWE_AGENT_ROOT:-/storage/openpsi/users/public/projects/AWEAgent}}; cd "$AWE_ROOT" && PYTHONPATH=$PWD:$PYTHONPATH pip install -q -r requirements.txt && AENV_SYSTEM_URL=\${AENV_SYSTEM_URL} python -m aweagent.maintenance.clean_instances'
+
+cluster:
+  n_nodes: 16
+  n_gpus_per_node: 8
+  fileroot: /storage/openpsi/users/chucai.dzq/areal-data/experiments
+  name_resolve:
+    type: nfs
+    nfs_record_root: /storage/openpsi/users/chucai.dzq/areal-data/name_resolve/bailing-flash25-cc
+
+scheduler:
+  type: slurm
+
+gconfig:
+  n_samples: 8
+  min_new_tokens: 0
+  max_new_tokens: 131071
+  max_tokens: 131071
+  greedy: false
+  lora_name: ""
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 1000000
+
+rollout:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  # 16 SGLang replicas, TP=4. With actor below this consumes 16 * 8-GPU nodes.
+  backend: "sglang:d16t4p1"
+  max_concurrent_rollouts: 720
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  # Slightly more tolerant than the previous flash25 run (1), matching tau2-style
+  # off-policy tolerance while still dropping stale heads.
+  max_head_offpolicyness: 1
+  enable_rollout_tracing: true
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+  setup_timeout: 3600.0
+  workers_ready_timeout: 3600.0
+  request_timeout: 20000.0
+  request_retries: 3
+  pause_grace_period: 30
+  agent:
+    mode: inline
+    admin_api_key: ${oc.env:SWE_RL_ADMIN_API_KEY}
+    tool_call_parser: qwen25
+    reasoning_parser: deepseek-r1
+    chat_template_type: concat
+    engine_max_tokens: ${gconfig.max_tokens}
+    export_style: concat
+    turn_discount: 1.0
+    session_timeout_seconds: 3600
+    prefix_matcher: examples.swe.prefix_matchers.swe_prefix_matcher
+    message_preprocessors:
+      - examples.swe.preprocessors.StripAnthropicBillingHeader
+      - examples.swe.preprocessors.StripAllSystemReminders
+      - examples.swe.preprocessors.StripAnthropicCacheFields
+      - examples.swe.preprocessors.NormalizeToolCallArguments
+
+actor:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  backend: "megatron:(attn:d2p4c8|ffn:d2p4e8)"
+  path: /storage/openpsi/users/wanghaitao.wht/project/swe-rl-alian/ring_2_5_flash_add_new100wdata_basedsft_1e4_128k_0204
+  setup_timeout: 3600.0
+  workers_ready_timeout: 3600.0
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  grad_reduce_dtype: float32
+  mb_spec:
+    n_mbs: 1
+    granularity: 1
+    max_tokens_per_mb: 131072
+    n_mbs_divisor: 1
+  optimizer:
+    type: adam
+    lr: 3.0e-6
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.001
+  megatron:
+    wrap_with_ddp: true
+    ddp:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: true
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+    use_deterministic_algorithms: true
+    enable_fp32_lm_head: false
+    cross_entropy_loss_fusion: false
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    moe_router_dtype: fp32
+    moe_token_dispatcher_type: alltoall
+    moe_router_bias_update_rate: 0.0
+  eps_clip: 0.2
+  eps_clip_higher: 0.28
+  temperature: ${gconfig.temperature}
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: false
+  prox_logp_method: recompute
+  use_decoupled_loss: true
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: ratio
+    upper: 5.0
+  discount: 1.0
+  gae_lambda: 1.0
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  reward_clip: 5.0
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+    eps: 1.0e-5
+  adv_norm:
+    mean_level: null
+    std_level: null
+  mask_no_eos_with_zero: true
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 4
+      mem: 32
+      exclusive: true
+      reservation: swe-rl
+      nodelist: null
+      exclude: null
+      image: /storage/openpsi/images/areal-dev-sglang-20260401.sif
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        NCCL_TIMEOUT: 1800
+        NCCL_DEBUG: WARN
+        NCCL_CUMEM_ENABLE: 0
+        NCCL_NVLS_ENABLE: 0
+        PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+        HOME: "/storage/openpsi/users/chucai.dzq/areal-data/cache/home"
+        FLASHINFER_WORKSPACE_DIR: "/storage/openpsi/users/chucai.dzq/areal-data/cache/flashinfer"
+        HF_HOME: "/storage/openpsi/users/chucai.dzq/areal-data/cache/hf"
+        XDG_CACHE_HOME: "/storage/openpsi/users/chucai.dzq/areal-data/cache/xdg"
+        AREAL_STORAGE: "/storage/openpsi/users/chucai.dzq/codes/swe-rl-areal/AReaL"
+        AREAL_PYTHON_EXECUTABLE: "/AReaL/.venv/bin/python3"
+        FLASH_LINEAR_ATTENTION: "/storage/openpsi/users/public/projects/flash-linear-attention"
+        TRITON_CACHE_DIR: "/tmp/areal-${oc.env:USER,admin}-${trial_name}/triton_cache/$HOSTNAME"
+        PYTHONPATH: "/storage/openpsi/users/chucai.dzq/codes/swe-rl-areal/AReaL:/storage/openpsi/users/public/projects/AWEAgent:/storage/openpsi/users/public/projects/flash-linear-attention"
+        AENV_SYSTEM_URL: "http://33.180.184.68"
+        REMOTE_PROXY_SERVICE_URL: ${oc.env:REMOTE_PROXY_SERVICE_URL,""}
+        REMOTE_PROXY_API_KEY: ${oc.env:REMOTE_PROXY_API_KEY,""}
+        SWE_AGENT_ROOT: "/storage/openpsi/users/public/projects/AWEAgent"
+        AWEAGENT_ROOT: "/storage/openpsi/users/public/projects/AWEAgent"
+        OPENAI_MODEL: "bailing-flash25"
+        LLM_MODEL: "bailing-flash25"
+        WANDB_DIR: "/storage/openpsi/users/chucai.dzq/areal-data/wandb"
+        AREAL_CACHE_DIR: "/tmp/areal-${oc.env:USER,admin}-${trial_name}"
+        PYTORCH_KERNEL_CACHE_PATH: "/tmp/areal-${oc.env:USER,admin}-${trial_name}/torch_kernel_cache/$HOSTNAME"
+        TORCHINDUCTOR_CACHE_DIR: "/tmp/areal-${oc.env:USER,admin}-${trial_name}/torchinductor_cache/$HOSTNAME"
+        TORCH_EXTENSIONS_DIR: "/tmp/areal-${oc.env:USER,admin}-${trial_name}/torch_extensions/$HOSTNAME"
+        VLLM_CACHE_ROOT: "/tmp/areal-${oc.env:USER,admin}-${trial_name}/vllm_cache/$HOSTNAME"
+      additional_bash_cmds:
+        - "export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt PIP_CERT=/etc/ssl/certs/ca-certificates.crt"
+        - 'export HF_MODULES_CACHE="$AREAL_CACHE_DIR/hf_modules/rank_$SLURM_PROCID"; mkdir -p "$HF_MODULES_CACHE"'
+        - "/AReaL/.venv/bin/python -m ensurepip --upgrade >/dev/null 2>&1 || true"
+        - "/AReaL/.venv/bin/python -m pip install --no-deps aenvironment==0.1.8rc2 || echo 'WARN: aenvironment install failed'"
+        - "/AReaL/.venv/bin/python -m pip install 'fastmcp<3' || echo 'WARN: fastmcp install failed'"
+        - "/AReaL/.venv/bin/python -c 'import aenv, aweagent' || echo 'WARN: aenv/aweagent import failed'"
+        - 'python "\${AREAL_STORAGE}/examples/swe/rl/flash/apply_sgl_radix_cache_patch.py"'
+        - export LD_PRELOAD=$(find /AReaL/.venv -name 'torch_memory_saver_hook_mode_preload.abi3.so' 2>/dev/null | head -1)
+
+ref:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  backend: ${actor.backend}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: false
+  dtype: ${actor.dtype}
+  mb_spec:
+    n_mbs: 1
+    granularity: 1
+    max_tokens_per_mb: 131072
+    n_mbs_divisor: 1
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+
+econfig:
+  dataset_path: ""
+  agent_type: cc
+  agent_config: ""
+  swe_agent_config: 1_0_0/min-swe-agent-train-top1
+  cc_agent_config: train_cc_time3600
+  agent_root: /storage/openpsi/users/public/projects/AWEAgent
+  swe_agent_root: /storage/openpsi/users/public/projects/AWEAgent
+  llm_model: bailing-flash25
+  opencode_provider: ""
+  codex_provider: ""
+  max_completion_tokens: 131071
+  timeout: 3600.0
+
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: false
+  dtype: auto
+  context_length: null
+  max_prefill_tokens: 32768
+  max_running_requests: 128
+  mem_fraction_static: 0.7
+  schedule_policy: fcfs
+  schedule_conservativeness: 1.0
+  attention_backend: fa3
+  log_level: info
+  log_level_http: null
+  log_requests: false
+  log_requests_level: 0
+  sampling_backend: pytorch
+  enable_metrics: true
+  enable_memory_saver: false
+  disable_cuda_graph: false
+  disable_radix_cache: false
+  disable_cuda_graph_padding: false
+  enable_nccl_nvls: false
+  disable_outlines_disk_cache: false
+  disable_custom_all_reduce: true
+  disable_overlap_schedule: false
+  enable_mixed_chunk: false
+  enable_dp_attention: false
+  enable_ep_moe: false
+  enable_torch_compile: false
+  torch_compile_max_bs: 32
+  triton_attention_reduce_in_fp32: false
+  triton_attention_num_kv_splits: 16
+  cuda_graph_bs: [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512]
+  num_continuous_decode_steps: 1
+  enable_nan_detection: false
+  allow_auto_truncate: false
+  enable_p2p_check: false
+  chunked_prefill_size: null
+  kv_cache_dtype: auto
+  cpu_offload_gb: 0
+  dp_size: 1
+  show_time_cost: false
+  enable_multithread_load: false
+  # The reference flash25 run used json_model_override_args to force
+  # linear_backend=seg_la. This branch's SGLangConfig does not expose that
+  # field; keep it inactive unless areal/api/cli_args.py is extended. The
+  # target checkpoint config already contains model_type=bailing_hybrid and
+  # architectures=["BailingMoeV2_5ForCausalLM"].
+  # json_model_override_args: '{"linear_backend": "seg_la", "model_type": "bailing_hybrid", "architectures": ["BailingMoeV2_5ForCausalLM"]}'
+
+train_dataset:
+  batch_size: 8
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: /storage/openpsi/users/fenghui/projects/AWEAgent_DEV/AWEAgent/src/data/swe_bench_verified_rl.jsonl
+  type: rl
+  max_length: 16384
+  drop_last: true
+
+valid_dataset:
+  batch_size: 8
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: /storage/openpsi/users/fenghui/projects/AWEAgent_DEV/AWEAgent/src/data/swe_bench_verified_rl.jsonl
+  type: rl
+  drop_last: false
+
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: 10
+  freq_secs: null
+
+recover:
+  mode: auto
+  retries: 3
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_secs: 7200
+  no_save_optim: false
+  no_load_optim: false
+  freq_steps: 10
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: online
+    wandb_base_url: http://8.150.1.98:8080
+
+perf_tracer:
+  enabled: false
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  session_tracer:
+    enabled: false

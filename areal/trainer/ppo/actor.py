@@ -140,7 +140,17 @@ class PPOActor:
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return batched_call(self._compute_advantages, data)
+        # Inject per-group sizes ONLY on this path so group-level reward
+        # normalization handles variable-size trajectory groups (failed/filtered
+        # rollout samples make some groups smaller than n_samples). Kept out of
+        # the generic batched_call to avoid leaking a non-tensor key into the
+        # forward / compute_logp path.
+        from areal.utils.data import concat_batch, split_batch
+
+        batched, meta = concat_batch(data)
+        batched["_traj_group_sizes"] = meta.traj_group_sizes
+        result = self._compute_advantages(batched)
+        return split_batch(result, meta)
 
     def _compute_advantages(self, data: dict[str, Any]) -> dict[str, Any]:
         bs = data["input_ids"].shape[0]
@@ -169,8 +179,15 @@ class PPOActor:
         reward_score = torch.clip(
             reward_score, max=self.reward_clip, min=-self.reward_clip
         )
+        # Pop per-group sizes injected by compute_advantages; pass as
+        # group_boundaries so reward_norm slices variable-size groups correctly
+        # (prevents std=0 → advantage exploding to reward/eps). Pop so the
+        # non-tensor key never reaches split_batch.
+        group_boundaries = data.pop("_traj_group_sizes", None)
         if self.reward_norm:
-            reward_score = self.reward_norm(reward_score)
+            reward_score = self.reward_norm(
+                reward_score, group_boundaries=group_boundaries
+            )
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
@@ -423,6 +440,8 @@ def grpo_loss_fn(
     use_decoupled_loss: bool = False,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
+    vocab_mean_logits: torch.Tensor | None = None,
+    vocab_norm_logits: torch.Tensor | None = None,
 ):
     """Loss function for actor step, all inputs should be splitted into
     pipeline micro batches, returns loss and logging stats."""

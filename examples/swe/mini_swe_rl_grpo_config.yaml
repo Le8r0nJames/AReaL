@@ -1,0 +1,40 @@
+# Mini SWE agent RL profile.
+#
+# This is the current-branch equivalent of
+# swe/main:examples/swe/rl/mini_swe_rl_grpo_config.yaml, adapted to the
+# Qwen3-Coder SWE-RL base config and the flattened examples/swe layout.
+
+defaults:
+  - qwen3_30b_a3b_grpo_4n_2t2r
+  - _self_
+
+experiment_name: chucai-mini-swe-rl-qwen
+trial_name: mini-swe
+total_train_steps: 1000
+total_train_epochs: 17
+should_accept_fn: "areal.examples.filter_function.filter_function"
+
+gconfig:
+  n_samples: 8
+
+rollout:
+  consumer_batch_size: 8
+  max_head_offpolicyness: 2
+
+actor:
+  reward_norm:
+    group_size: ${gconfig.n_samples}
+
+train_dataset:
+  path: /storage/openpsi/users/fenghui/projects/AWEAgent_DEV/AWEAgent/src/data/swe_bench_verified_rl.jsonl
+  batch_size: 8
+
+valid_dataset:
+  path: /storage/openpsi/users/fenghui/projects/AWEAgent_DEV/AWEAgent/src/data/swe_bench_verified_rl.jsonl
+  batch_size: 8
+
+econfig:
+  agent_type: swe
+  agent_config: ""
+  swe_agent_config: 1_0_0/min-swe-agent-train-top1
+  timeout: 3600.0

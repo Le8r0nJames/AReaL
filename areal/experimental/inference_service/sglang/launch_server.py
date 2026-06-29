@@ -15,11 +15,12 @@ import sys
 
 
 def areal_launch_server(server_args) -> None:
-    from sglang.srt.entrypoints.engine import Engine, init_tokenizer_manager
+    from sglang.srt.entrypoints.engine import init_tokenizer_manager
+    from sglang.srt.entrypoints import http_server
     from sglang.srt.entrypoints.http_server import (
         _execute_server_warmup,
-        _setup_and_run_http_server,
         app,
+        launch_server,
     )
     from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 
@@ -36,46 +37,42 @@ def areal_launch_server(server_args) -> None:
 
     # ---- BEGIN AREAL ----
     result_ipc = create_result_ipc()
-    # ---- END AREAL ----
-
-    (
-        tokenizer_manager,
-        template_manager,
-        port_args,
-        scheduler_init_result,
-        subprocess_watchdog,
-    ) = Engine._launch_subprocesses(
-        server_args=server_args,
-        init_tokenizer_manager_func=init_tokenizer_manager,
-        # ---- BEGIN AREAL ----
-        run_scheduler_process_func=areal_run_scheduler_process,
-        # ---- END AREAL ----
-        run_detokenizer_process_func=run_detokenizer_process,
-    )
-
-    # ---- BEGIN AREAL ----
-    if tokenizer_manager is None:
-        return
+    rpc_proxy: RpcProxy | None = None
     # ---- END AREAL ----
 
     # ---- BEGIN AREAL ----
-    rpc_proxy = RpcProxy(port_args, result_ipc)
-    register_awex_endpoints(app, rpc_proxy)
+    original_launch_subprocesses = http_server._launch_subprocesses
+
+    def capture_launch_subprocesses(*args, **kwargs):
+        nonlocal rpc_proxy
+        result = original_launch_subprocesses(*args, **kwargs)
+        # SGLang 0.5.9 returns
+        # (tokenizer_manager, template_manager, scheduler_infos, port_args).
+        tokenizer_manager = result[0]
+        port_args = result[3]
+        if tokenizer_manager is not None:
+            rpc_proxy = RpcProxy(port_args, result_ipc)
+            register_awex_endpoints(app, rpc_proxy)
+        return result
     # ---- END AREAL ----
 
     try:
-        _setup_and_run_http_server(
-            server_args,
-            tokenizer_manager,
-            template_manager,
-            port_args,
-            scheduler_init_result.scheduler_infos,
-            subprocess_watchdog,
+        # SGLang 0.5.9 removed the private _setup_and_run_http_server helper.
+        # Use the public launch_server entrypoint while injecting AReaL's
+        # scheduler process and AWEX FastAPI routes.
+        http_server._launch_subprocesses = capture_launch_subprocesses
+        launch_server(
+            server_args=server_args,
+            init_tokenizer_manager_func=init_tokenizer_manager,
+            run_scheduler_process_func=areal_run_scheduler_process,
+            run_detokenizer_process_func=run_detokenizer_process,
             execute_warmup_func=_execute_server_warmup,
         )
     finally:
         # ---- BEGIN AREAL ----
-        rpc_proxy.close()
+        http_server._launch_subprocesses = original_launch_subprocesses
+        if rpc_proxy is not None:
+            rpc_proxy.close()
         # ---- END AREAL ----
 
 
