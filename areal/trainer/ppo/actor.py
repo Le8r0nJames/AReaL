@@ -25,6 +25,8 @@ from areal.utils.data import (
     KLEstimator,
     Normalization,
     batched_call,
+    concat_batch,
+    split_batch,
     split_padded_tensor_dict_into_mb_list,
 )
 from areal.utils.functional import (
@@ -141,7 +143,15 @@ class PPOActor:
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return batched_call(self._compute_advantages, data)
+        # Inject per-group sizes ONLY on this path so group-level reward
+        # normalization handles variable-size trajectory groups (failed/filtered
+        # rollout samples make some groups smaller than n_samples). Kept out of
+        # the generic batched_call to avoid leaking a non-tensor key into the
+        # forward / compute_logp path.
+        batched, meta = concat_batch(data)
+        batched["_traj_group_sizes"] = meta.traj_group_sizes
+        result = self._compute_advantages(batched)
+        return split_batch(result, meta)
 
     def _compute_advantages(self, data: dict[str, Any]) -> dict[str, Any]:
         bs = data["input_ids"].shape[0]
@@ -170,8 +180,15 @@ class PPOActor:
         reward_score = torch.clip(
             reward_score, max=self.reward_clip, min=-self.reward_clip
         )
+        # Pop per-group sizes injected by compute_advantages; pass as
+        # group_boundaries so reward_norm slices variable-size groups correctly
+        # (prevents std=0 → advantage exploding to reward/eps). Pop so the
+        # non-tensor key never reaches split_batch.
+        group_boundaries = data.pop("_traj_group_sizes", None)
         if self.reward_norm:
-            reward_score = self.reward_norm(reward_score)
+            reward_score = self.reward_norm(
+                reward_score, group_boundaries=group_boundaries
+            )
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
@@ -237,7 +254,12 @@ class PPOActor:
 
         # Optionally perform advantage normalization.
         if self.adv_norm is not None:
-            advantages = self.adv_norm(advantages, loss_mask)
+            # Pass group_boundaries so group-level advantage normalization also
+            # slices variable-size trajectory groups exactly (same rationale as
+            # reward_norm above). Ignored when adv_norm is batch-level.
+            advantages = self.adv_norm(
+                advantages, loss_mask, group_boundaries=group_boundaries
+            )
 
         # Store data in the dict.
         data["advantages"] = advantages
